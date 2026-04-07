@@ -1,6 +1,7 @@
 from os import makedirs, path
 from typing import Callable, Dict, Iterable, Optional, Tuple
 
+import cv2 as cv
 import numpy as np
 import piq
 import torch
@@ -19,6 +20,7 @@ class LAM(LightningModule):
     def __init__(
         self,
         image_channels: int = 3,
+        flow_channels: int = 0,
         # Latent action autoencoder
         lam_model_dim: int = 512,
         lam_latent_dim: int = 32,
@@ -34,6 +36,7 @@ class LAM(LightningModule):
         ckpt_path: Optional[str] = None
     ) -> None:
         super(LAM, self).__init__()
+        self.flow_mode = flow_channels > 0
         self.lam = LatentActionModel(
             in_dim=image_channels,
             model_dim=lam_model_dim,
@@ -42,7 +45,8 @@ class LAM(LightningModule):
             enc_blocks=lam_enc_blocks,
             dec_blocks=lam_dec_blocks,
             num_heads=lam_num_heads,
-            dropout=lam_dropout
+            dropout=lam_dropout,
+            flow_channels=flow_channels
         )
         self.beta = beta
         self.log_interval = log_interval
@@ -68,24 +72,33 @@ class LAM(LightningModule):
 
     def shared_step(self, batch: Dict) -> Tuple:
         outputs = self.lam(batch)
-        gt_future_frames = batch["videos"][:, 1:]
-
-        # Compute loss
-        mse_loss = ((gt_future_frames - outputs["recon"]) ** 2).mean()
         kl_loss = -0.5 * torch.sum(1 + outputs["z_var"] - outputs["z_mu"] ** 2 - outputs["z_var"].exp(), dim=1).mean()
-        loss = mse_loss + self.beta * kl_loss
 
-        # Compute monitoring measurements
-        gt = gt_future_frames.clamp(0, 1).reshape(-1, *gt_future_frames.shape[2:]).permute(0, 3, 1, 2)
-        recon = outputs["recon"].clamp(0, 1).reshape(-1, *outputs["recon"].shape[2:]).permute(0, 3, 1, 2)
-        psnr = piq.psnr(gt, recon).mean()
-        ssim = piq.ssim(gt, recon).mean()
-        return outputs, loss, (
-            ("mse_loss", mse_loss),
-            ("kl_loss", kl_loss),
-            ("psnr", psnr),
-            ("ssim", ssim)
-        )
+        if self.flow_mode:
+            gt_flow = batch["flow"]  # (B, 1, H, W, 2)
+            pred_flow = outputs["flow_pred"]  # (B, 1, H, W, 2)
+            mse_loss = ((gt_flow - pred_flow) ** 2).mean()
+            loss = mse_loss + self.beta * kl_loss
+            epe = torch.norm(gt_flow - pred_flow, p=2, dim=-1).mean()
+            return outputs, loss, (
+                ("mse_loss", mse_loss),
+                ("kl_loss", kl_loss),
+                ("epe", epe),
+            )
+        else:
+            gt_future_frames = batch["videos"][:, 1:]
+            mse_loss = ((gt_future_frames - outputs["recon"]) ** 2).mean()
+            loss = mse_loss + self.beta * kl_loss
+            gt = gt_future_frames.clamp(0, 1).reshape(-1, *gt_future_frames.shape[2:]).permute(0, 3, 1, 2)
+            recon = outputs["recon"].clamp(0, 1).reshape(-1, *outputs["recon"].shape[2:]).permute(0, 3, 1, 2)
+            psnr = piq.psnr(gt, recon).mean()
+            ssim = piq.ssim(gt, recon).mean()
+            return outputs, loss, (
+                ("mse_loss", mse_loss),
+                ("kl_loss", kl_loss),
+                ("psnr", psnr),
+                ("ssim", ssim)
+            )
 
     def training_step(self, batch: Dict, batch_idx: int) -> Tensor:
         # Compute the training loss
@@ -151,18 +164,38 @@ class LAM(LightningModule):
         self.log_images(batch, outputs, "test")
         return loss
 
+    @staticmethod
+    def flow_to_color(flow: np.ndarray) -> np.ndarray:
+        """Convert optical flow (H, W, 2) to RGB visualization (H, W, 3)."""
+        h, w, _ = flow.shape
+        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        ang = np.arctan2(flow[..., 1], flow[..., 0])
+        hsv = np.zeros((h, w, 3), dtype=np.uint8)
+        hsv[..., 0] = (ang * 180 / np.pi / 2 + 180) % 180  # hue
+        hsv[..., 1] = 255  # saturation
+        max_mag = mag.max() + 1e-6
+        hsv[..., 2] = np.clip(mag / max_mag * 255, 0, 255).astype(np.uint8)  # value
+        return cv.cvtColor(hsv, cv.COLOR_HSV2RGB)
+
     def log_images(self, batch: Dict, outputs: Dict, split: str) -> None:
-        gt_seq = batch["videos"][0].clamp(0, 1).cpu()
-        recon_seq = outputs["recon"][0].clamp(0, 1).cpu()
-        recon_seq = torch.cat([gt_seq[:1], recon_seq], dim=0)
-        compare_seq = torch.cat([gt_seq, recon_seq], dim=1)
-        compare_seq = rearrange(compare_seq * 255, "t h w c -> h (t w) c")
-        compare_seq = compare_seq.detach().numpy().astype(np.uint8)
+        if self.flow_mode:
+            gt_flow = batch["flow"][0, 0].cpu().detach().numpy()  # (H, W, 2)
+            pred_flow = outputs["flow_pred"][0, 0].cpu().detach().numpy()  # (H, W, 2)
+            gt_vis = self.flow_to_color(gt_flow)
+            pred_vis = self.flow_to_color(pred_flow)
+            compare = np.concatenate([gt_vis, pred_vis], axis=1)  # (H, 2W, 3)
+        else:
+            gt_seq = batch["videos"][0].clamp(0, 1).cpu()
+            recon_seq = outputs["recon"][0].clamp(0, 1).cpu()
+            recon_seq = torch.cat([gt_seq[:1], recon_seq], dim=0)
+            compare_seq = torch.cat([gt_seq, recon_seq], dim=1)
+            compare = rearrange(compare_seq * 255, "t h w c -> h (t w) c")
+            compare = compare.detach().numpy().astype(np.uint8)
+
         img_path = path.join(self.log_path, f"{split}_step{self.global_step:06}.png")
         makedirs(path.dirname(img_path), exist_ok=True)
-        img = Image.fromarray(compare_seq)
         try:
-            img.save(img_path)
+            Image.fromarray(compare).save(img_path)
         except:
             pass
 

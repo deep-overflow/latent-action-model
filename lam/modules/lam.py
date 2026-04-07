@@ -21,13 +21,16 @@ class LatentActionModel(nn.Module):
         enc_blocks: int,
         dec_blocks: int,
         num_heads: int,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        flow_channels: int = 0
     ) -> None:
         super(LatentActionModel, self).__init__()
         self.model_dim = model_dim
         self.latent_dim = latent_dim
         self.patch_size = patch_size
+        self.flow_mode = flow_channels > 0
         patch_token_dim = in_dim * patch_size ** 2
+        dec_out_dim = flow_channels * patch_size ** 2 if self.flow_mode else patch_token_dim
 
         self.action_prompt = nn.Parameter(torch.empty(1, 1, 1, patch_token_dim))
         nn.init.uniform_(self.action_prompt, a=-1, b=1)
@@ -45,7 +48,7 @@ class LatentActionModel(nn.Module):
         self.decoder = SpatioTransformer(
             in_dim=model_dim,
             model_dim=model_dim,
-            out_dim=patch_token_dim,
+            out_dim=dec_out_dim,
             num_blocks=dec_blocks,
             num_heads=num_heads,
             dropout=dropout
@@ -101,10 +104,9 @@ class LatentActionModel(nn.Module):
 
         # Decode
         video_recon = self.decoder(video_action_patches)
-        video_recon = F.sigmoid(video_recon)
-        outputs.update(
-            {
-                "recon": unpatchify(video_recon, self.patch_size, H, W)
-            }
-        )
+        if self.flow_mode:
+            outputs["flow_pred"] = unpatchify(video_recon, self.patch_size, H, W)
+        else:
+            video_recon = F.sigmoid(video_recon)
+            outputs["recon"] = unpatchify(video_recon, self.patch_size, H, W)
         return outputs

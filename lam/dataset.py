@@ -1,8 +1,9 @@
 import math
 from random import choices, randint
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 from pathlib import Path
 
+import numpy as np
 import os
 os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = str(2 ** 13)
 import cv2 as cv
@@ -145,14 +146,17 @@ class VideoDataset(Dataset):
         randomize: bool = False,
         num_frames: int = 16,
         output_format: str = "t h w c",
-        color_aug: bool = True
+        color_aug: bool = True,
+        flow_dir: Optional[str] = None
     ) -> None:
         super(VideoDataset, self).__init__()
+        self.subset_path = subset_path
         self.padding = padding
         self.randomize = randomize
         self.num_frames = num_frames
         self.output_format = output_format
         self.color_aug = color_aug
+        self.flow_dir = flow_dir
 
         # Get all the file path based on the split path
         mp4_list = list(Path(subset_path).rglob("*.mp4"))
@@ -171,12 +175,12 @@ class VideoDataset(Dataset):
         video_path = self.file_names[idx]
         while True:
             try:
-                video = self.load_video_slice(
+                video, start_frame, frame_skip = self.load_video_slice(
                     video_path,
                     self.num_frames,
                     None if self.randomize else 0
                 )
-                return self.build_data_dict(video)
+                return self.build_data_dict(video, video_path, start_frame, frame_skip)
             except:
                 idx = randint(0, len(self) - 1)
                 video_path = self.file_names[idx]
@@ -187,32 +191,30 @@ class VideoDataset(Dataset):
         num_frames: int,
         start_frame: int = None,
         frame_skip: int = 1
-    ) -> Tensor:
+    ):
         cap = cv.VideoCapture(video_path)
         total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
         frame_skip = randint(1, 4)
-        num_frames = num_frames * frame_skip
+        num_frames_raw = num_frames * frame_skip
 
-        start_frame = start_frame if exists(start_frame) else randint(0, max(0, total_frames - num_frames))
+        start_frame = start_frame if exists(start_frame) else randint(0, max(0, total_frames - num_frames_raw))
         cap.set(cv.CAP_PROP_POS_FRAMES, start_frame)
         frames = []
-        for _ in range(num_frames):
+        for _ in range(num_frames_raw):
             ret, frame = cap.read()
             if ret:
-                # Frame was successfully read, parse it
                 frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
                 frame = torch.from_numpy(frame)
                 frames.append(frame)
             else:
-                # Reach the end of video, deal with padding and return
                 if self.padding == "none":
                     pass
                 elif self.padding == "repeat":
-                    frames.extend([frames[-1]] * (num_frames - len(frames)))
+                    frames.extend([frames[-1]] * (num_frames_raw - len(frames)))
                 elif self.padding == "zero":
-                    frames.extend([torch.zeros_like(frames[-1])] * (num_frames - len(frames)))
+                    frames.extend([torch.zeros_like(frames[-1])] * (num_frames_raw - len(frames)))
                 elif self.padding == "random":
-                    frames.extend([torch.rand_like(frames[-1])] * (num_frames - len(frames)))
+                    frames.extend([torch.rand_like(frames[-1])] * (num_frames_raw - len(frames)))
                 else:
                     raise ValueError(f"Invalid padding type: {self.padding}")
                 break
@@ -236,16 +238,29 @@ class VideoDataset(Dataset):
         video = rearrange(video, "t h w c -> c t h w")
         video = F.interpolate(video, (240, 320), mode="bilinear")
         video = rearrange(video, f"c t h w -> {self.output_format}")
-        return video
+        return video, start_frame, frame_skip
 
-    def build_data_dict(self, video: Tensor) -> Dict:
+    def _load_flow(self, video_path, start_frame: int, frame_skip: int) -> Tensor:
+        """Load pre-computed optical flow and accumulate over frame_skip."""
+        rel_path = Path(video_path).relative_to(self.subset_path)
+        flow_path = Path(self.flow_dir) / rel_path.with_suffix(".npy")
+        all_flow = np.load(flow_path)  # (N_frames-1, H, W, 2), float16
+
+        # Accumulate flow over frame_skip: sum(flow[start:start+skip])
+        end_idx = min(start_frame + frame_skip, len(all_flow))
+        start_idx = min(start_frame, len(all_flow) - 1)
+        accumulated = all_flow[start_idx:end_idx].sum(axis=0)  # (H, W, 2)
+        return torch.from_numpy(accumulated.astype(np.float32)).unsqueeze(0)  # (1, H, W, 2)
+
+    def build_data_dict(self, video: Tensor, video_path=None, start_frame: int = 0, frame_skip: int = 1) -> Dict:
         if self.color_aug:
-            # Brightness jitter
             video = (video + torch.rand(1) * 0.2 - 0.1).clamp(0, 1)
 
-        data_dict = {
-            "videos": video
-        }
+        data_dict = {"videos": video}
+
+        if self.flow_dir is not None and video_path is not None:
+            data_dict["flow"] = self._load_flow(video_path, start_frame, frame_skip)
+
         return data_dict
 
 
@@ -372,13 +387,14 @@ class MultiSourceSamplerDataset(Dataset):
         samples_per_epoch: int = 1000000,
         sampling_strategy: str = "sample",
         color_aug: bool = True,
+        flow_dir: Optional[str] = None,
         **kwargs
     ) -> None:
         self.samples_per_epoch = samples_per_epoch
 
         self.subsets = []
         for subset_path in tqdm(dataset_paths, desc="Loading subsets..."):
-            self.subsets.append(VideoDataset(subset_path=subset_path, color_aug=color_aug, **kwargs))
+            self.subsets.append(VideoDataset(subset_path=subset_path, color_aug=color_aug, flow_dir=flow_dir, **kwargs))
             print("Subset:", subset_path, "Number of samples:", len(self.subsets[-1]))
         print("Number of subsets:", len(self.subsets))
 
@@ -434,6 +450,7 @@ class LightningVideoDataset(LightningDataset):
         output_format: str = "t h w c",
         samples_per_epoch: int = 1000000,
         sampling_strategy: str = "sample",
+        flow_dir: Optional[str] = None,
         **kwargs
     ) -> None:
         super(LightningVideoDataset, self).__init__(**kwargs)
@@ -444,6 +461,7 @@ class LightningVideoDataset(LightningDataset):
         self.output_format = output_format
         self.samples_per_epoch = samples_per_epoch
         self.sampling_strategy = sampling_strategy
+        self.flow_dir = flow_dir
 
         self.save_hyperparameters()
 
@@ -457,7 +475,8 @@ class LightningVideoDataset(LightningDataset):
                 num_frames=self.num_frames,
                 output_format=self.output_format,
                 samples_per_epoch=self.samples_per_epoch,
-                sampling_strategy=self.sampling_strategy
+                sampling_strategy=self.sampling_strategy,
+                flow_dir=self.flow_dir
             )
             # self.val_dataset = MultiSourceSamplerDataset(
             #     dataset_paths=self.dataset_paths,
