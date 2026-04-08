@@ -77,13 +77,28 @@ class LAM(LightningModule):
         if self.flow_mode:
             gt_flow = batch["flow"]  # (B, 1, H, W, 2)
             pred_flow = outputs["flow_pred"]  # (B, 1, H, W, 2)
-            mse_loss = ((gt_flow - pred_flow) ** 2).mean()
+            mask = batch.get("flow_mask")  # (B, 1, H, W) bool or None
+
+            sq_err = (gt_flow - pred_flow) ** 2  # (B, 1, H, W, 2)
+            epe_per_pixel = torch.norm(gt_flow - pred_flow, p=2, dim=-1)  # (B, 1, H, W)
+
+            if mask is not None:
+                mask_f = mask.unsqueeze(-1).float()  # (B, 1, H, W, 1)
+                num_valid = mask_f.sum().clamp(min=1.0)
+                mse_loss = (sq_err * mask_f).sum() / (num_valid * 2)  # avg over 2 channels
+                epe = (epe_per_pixel * mask.float()).sum() / mask.float().sum().clamp(min=1.0)
+                mask_ratio = mask.float().mean()
+            else:
+                mse_loss = sq_err.mean()
+                epe = epe_per_pixel.mean()
+                mask_ratio = torch.tensor(1.0)
+
             loss = mse_loss + self.beta * kl_loss
-            epe = torch.norm(gt_flow - pred_flow, p=2, dim=-1).mean()
             return outputs, loss, (
                 ("mse_loss", mse_loss),
                 ("kl_loss", kl_loss),
                 ("epe", epe),
+                ("mask_ratio", mask_ratio),
             )
         else:
             gt_future_frames = batch["videos"][:, 1:]

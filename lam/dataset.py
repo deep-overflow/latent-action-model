@@ -240,17 +240,24 @@ class VideoDataset(Dataset):
         video = rearrange(video, f"c t h w -> {self.output_format}")
         return video, start_frame, frame_skip
 
-    def _load_flow(self, video_path, start_frame: int, frame_skip: int) -> Tensor:
-        """Load pre-computed optical flow and accumulate over frame_skip."""
+    def _load_flow(self, video_path, start_frame: int, frame_skip: int):
+        """Load pre-computed optical flow + mask, accumulate over frame_skip."""
         rel_path = Path(video_path).relative_to(self.subset_path)
-        flow_path = Path(self.flow_dir) / rel_path.with_suffix(".npy")
-        all_flow = np.load(flow_path)  # (N_frames-1, H, W, 2), float16
+        flow_path = Path(self.flow_dir) / rel_path.with_suffix(".npz")
+        data = np.load(flow_path)
+        all_flow = data["flow"]  # (N_frames-1, H, W, 2), float16
+        all_mask = data["mask"]  # (N_frames-1, H, W), bool
 
         # Accumulate flow over frame_skip: sum(flow[start:start+skip])
         end_idx = min(start_frame + frame_skip, len(all_flow))
         start_idx = min(start_frame, len(all_flow) - 1)
-        accumulated = all_flow[start_idx:end_idx].sum(axis=0)  # (H, W, 2)
-        return torch.from_numpy(accumulated.astype(np.float32)).unsqueeze(0)  # (1, H, W, 2)
+        accumulated_flow = all_flow[start_idx:end_idx].sum(axis=0)  # (H, W, 2)
+        # Mask: AND over all frames in the skip range (reliable only if all steps are reliable)
+        accumulated_mask = all_mask[start_idx:end_idx].all(axis=0)  # (H, W)
+
+        flow = torch.from_numpy(accumulated_flow.astype(np.float32)).unsqueeze(0)  # (1, H, W, 2)
+        mask = torch.from_numpy(accumulated_mask).unsqueeze(0)  # (1, H, W)
+        return flow, mask
 
     def build_data_dict(self, video: Tensor, video_path=None, start_frame: int = 0, frame_skip: int = 1) -> Dict:
         if self.color_aug:
@@ -259,7 +266,9 @@ class VideoDataset(Dataset):
         data_dict = {"videos": video}
 
         if self.flow_dir is not None and video_path is not None:
-            data_dict["flow"] = self._load_flow(video_path, start_frame, frame_skip)
+            flow, mask = self._load_flow(video_path, start_frame, frame_skip)
+            data_dict["flow"] = flow
+            data_dict["flow_mask"] = mask
 
         return data_dict
 
