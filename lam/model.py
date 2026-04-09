@@ -138,7 +138,7 @@ class LAM(LightningModule):
             on_epoch=False
         )
 
-        if batch_idx % self.log_interval == 0:  # Start of the epoch
+        if batch_idx % self.log_interval == 0 and self.global_rank == 0:
             self.log_images(batch, outputs, "train")
         return loss
 
@@ -194,11 +194,17 @@ class LAM(LightningModule):
 
     def log_images(self, batch: Dict, outputs: Dict, split: str) -> None:
         if self.flow_mode:
+            # Input frames: frame_t, frame_{t+1}
+            frames = batch["videos"][0].clamp(0, 1).cpu().detach().numpy()  # (T, H, W, 3)
+            frame_t = (frames[0] * 255).astype(np.uint8)  # (H, W, 3)
+            frame_t1 = (frames[1] * 255).astype(np.uint8)  # (H, W, 3)
+            # Flow visualizations
             gt_flow = batch["flow"][0, 0].cpu().detach().numpy()  # (H, W, 2)
             pred_flow = outputs["flow_pred"][0, 0].cpu().detach().numpy()  # (H, W, 2)
-            gt_vis = self.flow_to_color(gt_flow)
-            pred_vis = self.flow_to_color(pred_flow)
-            compare = np.concatenate([gt_vis, pred_vis], axis=1)  # (H, 2W, 3)
+            gt_vis = self.flow_to_color(gt_flow)  # (H, W, 3)
+            pred_vis = self.flow_to_color(pred_flow)  # (H, W, 3)
+            # Layout: frame_t | frame_{t+1} | GT flow | pred flow
+            compare = np.concatenate([frame_t, frame_t1, gt_vis, pred_vis], axis=1)  # (H, 4W, 3)
         else:
             gt_seq = batch["videos"][0].clamp(0, 1).cpu()
             recon_seq = outputs["recon"][0].clamp(0, 1).cpu()

@@ -1,7 +1,10 @@
 __pycache__/
 *.pyc
 .venv/
-outputs/
+outputs
 wandb/
 .env
 *.ckpt
+.claude/
+log_imgs/
+.gitignore

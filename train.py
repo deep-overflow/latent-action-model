@@ -11,5 +11,6 @@ from lam.model import LAM
 cli = LightningCLI(
     LAM,
     LightningVideoDataset,
-    seed_everything_default=32
+    seed_everything_default=32,
+    save_config_kwargs={"overwrite": True}
 )

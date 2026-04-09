@@ -157,7 +157,7 @@ def extract_features(args):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load stats for normalization
-    stats_path = Path("shared_meta/GR1_unified_stats.json")
+    stats_path = Path(args.stats_path) if args.stats_path else dataset_path / "meta" / "stats.json"
     stats = load_stats(str(stats_path))
 
     # Load episode metadata
@@ -182,16 +182,7 @@ def extract_features(args):
     # Load LAM
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading LAM from {args.ckpt_path}...")
-    lam = LAM(
-        image_channels=3,
-        lam_model_dim=1024,
-        lam_latent_dim=32,
-        lam_patch_size=16,
-        lam_enc_blocks=24,
-        lam_dec_blocks=24,
-        lam_num_heads=16,
-        ckpt_path=args.ckpt_path,
-    )
+    lam = LAM.load_from_checkpoint(args.ckpt_path, map_location=device)
     lam = lam.to(device).eval()
 
     all_z_reps = []
@@ -533,6 +524,8 @@ def main():
                            help="Sample every N-th frame pair per episode")
     p_extract.add_argument("--batch-size", type=int, default=64)
     p_extract.add_argument("--output-dir", type=str, default="outputs/lam_probe")
+    p_extract.add_argument("--stats-path", type=str, default=None,
+                           help="Path to stats JSON (default: <dataset_path>/meta/stats.json)")
 
     # Train
     p_train = subparsers.add_parser("train", help="Train linear probe")

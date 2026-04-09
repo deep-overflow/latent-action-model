@@ -29,6 +29,7 @@ data:
   output_format: t h w c
   samples_per_epoch: 100000
   sampling_strategy: dataset
+  num_workers: 8
 
 trainer:
   max_epochs: 1000

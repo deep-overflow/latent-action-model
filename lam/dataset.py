@@ -194,7 +194,12 @@ class VideoDataset(Dataset):
     ):
         cap = cv.VideoCapture(video_path)
         total_frames = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-        frame_skip = randint(1, 4)
+        # In flow mode, force skip=1 so the GT optical flow stays exact
+        # (no need for multi-frame composition).
+        if self.flow_dir is not None:
+            frame_skip = 1
+        else:
+            frame_skip = randint(1, 4)
         num_frames_raw = num_frames * frame_skip
 
         start_frame = start_frame if exists(start_frame) else randint(0, max(0, total_frames - num_frames_raw))
@@ -241,22 +246,20 @@ class VideoDataset(Dataset):
         return video, start_frame, frame_skip
 
     def _load_flow(self, video_path, start_frame: int, frame_skip: int):
-        """Load pre-computed optical flow + mask, accumulate over frame_skip."""
+        """Load pre-computed optical flow + mask for a single frame transition.
+        Assumes frame_skip == 1 (forced in load_video_slice when flow_dir is set).
+        """
         rel_path = Path(video_path).relative_to(self.subset_path)
-        flow_path = Path(self.flow_dir) / rel_path.with_suffix(".npz")
-        data = np.load(flow_path)
-        all_flow = data["flow"]  # (N_frames-1, H, W, 2), float16
-        all_mask = data["mask"]  # (N_frames-1, H, W), bool
+        flow_dir_path = Path(self.flow_dir) / rel_path.with_suffix("")
+        all_flow = np.load(flow_dir_path / "flow.npy", mmap_mode="r")  # (N-1, H, W, 2) float16
+        all_mask = np.load(flow_dir_path / "mask.npy", mmap_mode="r")  # (N-1, H, W) bool
 
-        # Accumulate flow over frame_skip: sum(flow[start:start+skip])
-        end_idx = min(start_frame + frame_skip, len(all_flow))
-        start_idx = min(start_frame, len(all_flow) - 1)
-        accumulated_flow = all_flow[start_idx:end_idx].sum(axis=0)  # (H, W, 2)
-        # Mask: AND over all frames in the skip range (reliable only if all steps are reliable)
-        accumulated_mask = all_mask[start_idx:end_idx].all(axis=0)  # (H, W)
+        idx = min(start_frame, len(all_flow) - 1)
+        single_flow = np.array(all_flow[idx]).astype(np.float32)  # (H, W, 2)
+        single_mask = np.array(all_mask[idx])  # (H, W)
 
-        flow = torch.from_numpy(accumulated_flow.astype(np.float32)).unsqueeze(0)  # (1, H, W, 2)
-        mask = torch.from_numpy(accumulated_mask).unsqueeze(0)  # (1, H, W)
+        flow = torch.from_numpy(single_flow).unsqueeze(0)  # (1, H, W, 2)
+        mask = torch.from_numpy(single_mask).unsqueeze(0)  # (1, H, W)
         return flow, mask
 
     def build_data_dict(self, video: Tensor, video_path=None, start_frame: int = 0, frame_skip: int = 1) -> Dict:

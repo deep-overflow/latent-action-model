@@ -164,9 +164,11 @@ def main():
     skipped = 0
     for video_path in tqdm(video_paths, desc="Computing flow"):
         rel_path = video_path.relative_to(video_dir)
-        flow_path = output_dir / rel_path.with_suffix(".npz")
+        out_dir = output_dir / rel_path.with_suffix("")
+        flow_npy = out_dir / "flow.npy"
+        mask_npy = out_dir / "mask.npy"
 
-        if flow_path.exists():
+        if flow_npy.exists() and mask_npy.exists():
             skipped += 1
             continue
 
@@ -179,8 +181,9 @@ def main():
             model, sea_raft_args, frames, device, args.batch_size, args.cycle_threshold
         )
 
-        flow_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(flow_path, flow=flows, mask=masks)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.save(flow_npy, flows)
+        np.save(mask_npy, masks)
 
     print(f"Done. Skipped {skipped} existing files.")
 
