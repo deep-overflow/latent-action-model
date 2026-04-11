@@ -329,7 +329,14 @@ def train_probe(args):
     z_val = data["z_rep_val"]            # (N_val, 32)
     a_val = data["delta_action_val"]     # (N_val, 29)
 
-    print(f"Train: {len(z_train)}, Val: {len(z_val)}")
+    # Standardize z_rep using train statistics, save for eval consistency
+    z_mean = z_train.mean(dim=0)
+    z_std = z_train.std(dim=0).clamp(min=1e-6)
+    torch.save({"mean": z_mean, "std": z_std}, feature_dir / "z_stats.pt")
+    z_train = (z_train - z_mean) / z_std
+    z_val = (z_val - z_mean) / z_std
+
+    print(f"Train: {len(z_train)}, Val: {len(z_val)}  (z standardized)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -344,6 +351,7 @@ def train_probe(args):
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
     best_val_loss = float("inf")
+    best_epoch = 0
     history = {"train_loss": [], "val_loss": []}
 
     for epoch in range(args.epochs):
@@ -376,10 +384,16 @@ def train_probe(args):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = epoch
             torch.save(probe.state_dict(), feature_dir / "probe_best.pt")
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:3d}/{args.epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}")
+        if (epoch + 1) % 20 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1:4d}/{args.epochs}  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  best={best_val_loss:.6f}@{best_epoch+1}")
+
+        # Early stopping
+        if args.patience > 0 and (epoch - best_epoch) >= args.patience:
+            print(f"Early stop at epoch {epoch+1} (no improvement for {args.patience} epochs)")
+            break
 
     # Save training history
     with open(feature_dir / "history.json", "w") as f:
@@ -411,6 +425,12 @@ def evaluate_probe(args):
     z_val = data["z_rep_val"]          # (N_val, 32)
     a_val = data["delta_action_val"]   # (N_val, 29)
 
+    # Apply same standardization as training (if stats available)
+    z_stats_path = feature_dir / "z_stats.pt"
+    if z_stats_path.exists():
+        z_stats = torch.load(z_stats_path, weights_only=True)
+        z_val = (z_val - z_stats["mean"]) / z_stats["std"]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load best probe
@@ -425,19 +445,27 @@ def evaluate_probe(args):
     # Overall MSE
     mse = ((pred - a_val) ** 2).mean().item()
 
-    # Per-joint R²
+    # Per-joint R² — mark zero-variance dims as NaN (constant joints)
     ss_res = ((a_val - pred) ** 2).sum(dim=0)   # (29,)
+    a_var = a_val.var(dim=0)                    # (29,)
     ss_tot = ((a_val - a_val.mean(dim=0)) ** 2).sum(dim=0)  # (29,)
-    r2_per_dim = (1 - ss_res / (ss_tot + 1e-8)).numpy()  # (29,)
+    valid_mask = a_var > 1e-12
+    r2_per_dim = np.full(len(ss_res), np.nan, dtype=np.float32)
+    r2_per_dim[valid_mask.numpy()] = (1 - ss_res[valid_mask] / ss_tot[valid_mask]).numpy()
 
-    # Group R² by joint group
+    # Group R² by joint group (only valid dims)
     group_r2 = {}
     for name, (start, end) in JOINT_GROUPS.items():
-        group_ss_res = ss_res[start:end].sum().item()
-        group_ss_tot = ss_tot[start:end].sum().item()
-        group_r2[name] = 1 - group_ss_res / (group_ss_tot + 1e-8)
+        m = valid_mask[start:end]
+        if m.any():
+            group_ss_res = ss_res[start:end][m].sum().item()
+            group_ss_tot = ss_tot[start:end][m].sum().item()
+            group_r2[name] = 1 - group_ss_res / group_ss_tot
+        else:
+            group_r2[name] = float("nan")
 
-    overall_r2 = 1 - ss_res.sum().item() / (ss_tot.sum().item() + 1e-8)
+    # Overall R² — only over valid dims
+    overall_r2 = 1 - ss_res[valid_mask].sum().item() / ss_tot[valid_mask].sum().item()
 
     # Print results
     print(f"\n{'='*50}")
@@ -489,13 +517,14 @@ def evaluate_probe(args):
     for name, (start, end) in JOINT_GROUPS.items():
         colors.extend([group_color_map[name]] * (end - start))
 
-    bars = ax.bar(range(len(r2_per_dim)), r2_per_dim, color=colors)
-    ax.set_xticks(range(len(r2_per_dim)))
+    r2_plot = np.where(np.isnan(r2_per_dim), 0, r2_per_dim)
+    bars = ax.bar(range(len(r2_plot)), r2_plot, color=colors)
+    ax.set_xticks(range(len(r2_plot)))
     ax.set_xticklabels(joint_names, rotation=45, ha="right", fontsize=8)
     ax.set_ylabel("R²")
     ax.set_title(f"LAM Linear Probe: Per-Joint R² (Overall R²={overall_r2:.4f})")
     ax.axhline(y=0, color="black", linewidth=0.5)
-    ax.set_ylim(min(r2_per_dim.min() - 0.1, -0.2), 1.05)
+    ax.set_ylim(min(np.nanmin(r2_per_dim) - 0.1, -0.2), 1.05)
     ax.grid(True, alpha=0.3, axis="y")
 
     # Legend
@@ -530,9 +559,11 @@ def main():
     # Train
     p_train = subparsers.add_parser("train", help="Train linear probe")
     p_train.add_argument("--feature-dir", type=str, default="outputs/lam_probe")
-    p_train.add_argument("--epochs", type=int, default=100)
+    p_train.add_argument("--epochs", type=int, default=500)
     p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--batch-size", type=int, default=512)
+    p_train.add_argument("--patience", type=int, default=50,
+                         help="Early stop if val loss does not improve for N epochs (0 to disable)")
 
     # Eval
     p_eval = subparsers.add_parser("eval", help="Evaluate probe")
